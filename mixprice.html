@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0"/>
+    <title>Mixcoin 价格助手</title>
+    <style type="text/css">
+      #records
+        {
+        font-family:"Trebuchet MS", Arial, Helvetica, sans-serif;
+        width:100%;
+        border-collapse:collapse;
+        }
+      
+      #records td, #records th 
+        {
+        font-size:1em;
+        border:1px solid #4CAF50;
+        padding:3px 7px 2px 7px;
+        }
+      
+      #records td:first-child, #records th:first-child {
+        width:160px;
+      }
+      
+      #records th 
+        {
+        font-size:1.1em;
+        text-align:left;
+        padding-top:5px;
+        padding-bottom:4px;
+        background-color:#4CAF50;
+        color:#ffffff;
+        }
+      
+      #records tr.alt td 
+        {
+        color:#000000;
+        background-color:#EAF2D3;
+        }
+      </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsrsasign/8.0.12/jsrsasign-all-min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/forge/0.7.6/forge.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.22.2/moment.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/node-uuid/1.4.8/uuid.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/msgpack5/4.2.0/msgpack5.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bignumber.js/9.0.0/bignumber.min.js"></script>
+    <script src="https://newbie.zeromesh.net/int64-buffer.min.js"></script>
+    <script type="text/javascript">
+      const AppPIN = "";  // keystore.json - pin
+      const AppPinToken = ""; // keystore.json - pin_token
+      const AppClientId = ''; // keystore.json - client_id
+      const AppSessionId = ''; // keystore.json - session_id
+      const AppPrivateKey = ``;  // keystore.json - private_key
+      const baseAssetId = "";   // 要交易币的 asset id
+      const quoteAssetId = "815b0b1a-2764-3736-8faa-42d694fa620a";  // Omni USDT
+      const oceanEngineId = "aaff5bef-42fb-4c9f-90e0-29f69176b7d4"; // 撮合引擎
+      const maxPrice = new BigNumber("1");                          // 最高价，防止撸 quote 资产
+      const minPrice = new BigNumber("0.8");                        // 最低价，防止撸 base 资产
+      const market = baseAssetId + "-" + quoteAssetId;
+      const minTradeVolumn = 10;                                    // 1 小时内最小成交量，单位 USDT
+      var intervalId = 0
+
+      function getAuthenticationToken(uid, sid, privateKey, method, uri, body) {
+        if (typeof body !== 'string') { body = ""; }
+
+        let expire = moment.utc().add(1, 'minutes').unix();
+        let md = forge.md.sha256.create();
+        md.update(method + uri + body);
+
+        var oHeader = {alg: 'RS512', typ: 'JWT'};
+        var oPayload = {
+          uid: uid,
+          sid: sid,
+          exp: expire,
+          jti: uuid().toString(),
+          sig: md.digest().toHex()
+        };
+        var sHeader = JSON.stringify(oHeader);
+        var sPayload = JSON.stringify(oPayload);
+        return KJUR.jws.JWS.sign('RS512', sHeader, sPayload, privateKey);
+      }
+
+      function requestMixin(method, path, params, callback) {
+        var body = JSON.stringify(params);
+        var url = 'https://api.mixin.one' + path;
+        var token = getAuthenticationToken(AppClientId, AppSessionId, AppPrivateKey, method, path, body);
+        return send(token, method, url, body, callback);
+      }
+
+      function requestOcean(method, path, params, callback) {
+        var body = JSON.stringify(params);
+        var url = 'https://events.ocean.one' + path;
+        var token = getAuthenticationToken(AppClientId, AppSessionId, AppPrivateKey, method, path, body);
+        return send(token, method, url, body, callback);
+      }
+
+      function send(token, method, url, body, callback) {
+        const self = this;
+        $.ajax({
+          type: method,
+          url: url,
+          contentType: "application/json",
+          data: body,
+          beforeSend: function(xhr) {
+            xhr.setRequestHeader("Authorization", "Bearer " + token);
+          },
+          success: function(resp) {
+            var consumed = false;
+            if (typeof callback === 'function') {
+              consumed = callback(resp);
+            }
+            if (!consumed && resp.error !== null && resp.error !== undefined) {
+              callback(resp);
+            }
+          },
+          error: function(event) {
+            alert(JSON.stringify(event.responseJSON));
+          }
+        });
+      }
+
+      function getLastTradePrice(callback) {
+        requestOcean('GET', '/markets/' + market + '/ticker', undefined, function(resp) {
+          if (resp.error) {
+            console.info(resp.error);
+            return "0";
+          } else {
+            callback(resp.data.price);
+          }
+        });
+      }
+
+      function hexToBytes(hex) {
+        const bytes = []
+        for (let c = 0; c < hex.length; c += 2) {
+          bytes.push(parseInt(hex.substr(c, 2), 16))
+        }
+        return bytes
+      }
+
+      function encryptPIN(pin) {
+        const privateKey = forge.pki.privateKeyFromPem(AppPrivateKey);
+        const pinKey = privateKey.decrypt(forge.util.decode64(AppPinToken), 'RSA-OAEP', {
+          md: forge.md.sha256.create(),
+          label: AppSessionId
+        });
+
+        let iterator = new Uint8Array(new Uint64LE(moment.utc().unix()).buffer)
+        iterator = forge.util.createBuffer(iterator)
+        iterator = iterator.getBytes()
+        let time = new Uint8Array(new Uint64LE(moment.utc().unix()).buffer)
+
+        time = forge.util.createBuffer(time)
+        time = time.getBytes()
+
+        let pinByte = forge.util.createBuffer(pin, 'utf8')
+        const blockSize = 16
+
+        let buffer = forge.util.createBuffer()
+        buffer.putBytes(pinByte)
+        buffer.putBytes(time)
+        buffer.putBytes(iterator)
+        let paddingLen = blockSize - (pinByte.length() % blockSize)
+        let padding = forge.util.hexToBytes(paddingLen.toString(16))
+
+        while (paddingLen > 0) {
+          paddingLen--
+          buffer.putBytes(padding)
+        }
+
+        let iv = forge.random.getBytesSync(16)
+        let key = hexToBytes(forge.util.binary.hex.encode(pinKey))
+        let cipher = forge.cipher.createCipher('AES-CBC', key)
+
+        cipher.start({
+          iv: iv,
+        })
+        cipher.update(buffer)
+        cipher.finish(() => true)
+
+        let pin_buff = forge.util.createBuffer()
+        pin_buff.putBytes(iv)
+        pin_buff.putBytes(cipher.output.getBytes())
+
+        const encryptedBytes = pin_buff.getBytes()
+        return forge.util.encode64(encryptedBytes);
+      }
+
+      function strip(key) {
+        if (key.indexOf('-----') !== -1) {
+          return key.split('-----')[2].replace(/\r?\n|\r/g, '');
+        }
+      }
+
+      function getDateString(){
+        var currentdate = new Date(); 
+        var datetime = currentdate.getFullYear() + "-"
+                + (currentdate.getMonth()+1)  + "-" 
+                + currentdate.getDate() + " "  
+                + currentdate.getHours() + ":"  
+                + currentdate.getMinutes() + ":" 
+                + currentdate.getSeconds();
+        return datetime;
+      }
+
+      function showError(errStr) {
+        clearInterval(intervalId);
+        $('#error h3').html("<h3>"+ errStr +"</h3>");
+        $('#error').show();
+      }
+
+      // 挂单 - 现价单
+      function makerOrder(price, amount, trace_id, callback) {
+        const params = {
+          asset_id : baseAssetId,
+          opponent_id : oceanEngineId,
+          amount : amount,
+          pin : encryptPIN(AppPIN),
+          trace_id : trace_id,
+          memo : msgpack5().encode({'T': 'L', 'P': price, 'S': 'A', 'A': uuid.parse(quoteAssetId)}).toString('base64').replace(/\+/g, '-').replace(/\//g, '_')
+        }
+        requestMixin('POST', '/transfers', params, function(resp) {
+          callback(resp);
+        });
+      }
+
+      // 吃单 - 市价单
+      function takerOrder(amount, trace_id, callback) {
+        const params = {
+          asset_id : quoteAssetId,
+          opponent_id : oceanEngineId,
+          amount : amount,
+          pin : encryptPIN(AppPIN),
+          trace_id : trace_id,
+          memo : msgpack5().encode({'T': 'M', 'S': 'B', 'A': uuid.parse(baseAssetId)}).toString('base64').replace(/\+/g, '-').replace(/\//g, '_')
+        }
+        requestMixin('POST', '/transfers', params, function(resp) {
+          callback(resp);
+        });
+      }
+
+      function startTrade() {
+        requestMixin('GET', '/assets/' + baseAssetId, undefined, function(resp) {
+          if (resp.error) {
+            showError(resp.error.code + ": " + resp.error.description);
+            return;
+          }
+          $('#error').hide();
+
+          const baseSymbol = resp.data.symbol;
+          const currentPrice = new BigNumber(resp.data.price_usd);
+          $('#current-price').text("当前价格：" + currentPrice.toString() + " USDT")
+
+          getLastTradePrice(function(price) {
+            const lastPrice = new BigNumber(price);
+            if (lastPrice.isZero()) {
+              showError("请先在 Mixcoin 手动挂单成交一次！")
+              return
+            }
+
+            // 随机砸盘和拉盘
+            const rnd = Math.random();
+            var nextPrice = lastPrice;
+            if(rnd <= 0.1) {
+              nextPrice = lastPrice.multipliedBy(0.98);
+            } else if(rnd <= 0.33) {
+              nextPrice = lastPrice.multipliedBy(0.99);
+            } else if(rnd <= 0.66) {
+              nextPrice = lastPrice;
+            } else if(rnd <= 0.9) {
+              nextPrice = lastPrice.multipliedBy(1.02);
+            } else {
+              nextPrice = lastPrice.multipliedBy(1.03);
+            }
+
+            // 最小价格 0.0001 USDT，小于这个价格挂单失败
+            if (nextPrice.isLessThan(0.0001)) {
+              nextPrice = new BigNumber(0.0001);
+            }
+            
+            // 设置最低价格，防止被薅羊毛
+            if (nextPrice.isLessThan(minPrice)) {
+              nextPrice = minPrice;
+            }
+
+            // 设置最高价格，防止被薅羊毛
+            if (nextPrice.isGreaterThan(maxPrice)) {
+              nextPrice = maxPrice;
+            }
+            const amount = new BigNumber(1.02).dividedBy(nextPrice).toFixed(6);
+
+            // 挂单
+            makerOrder(nextPrice.toString(), amount.toString(), uuid().toString(), function(resp) {
+              if (resp.error) {
+                showError(resp.error.code + ": " + resp.error.description);
+                return;
+              }
+
+              const takerAmount = minTradeVolumn / 10
+              setTimeout(function() {
+                // 吃单
+                takerOrder(takerAmount.toString(), uuid().toString(), function(resp) {
+                  if (resp.error) {
+                    showError(resp.error.code + ": " + resp.error.description);
+                    return;
+                  }
+                  const maker = "以 " + nextPrice.toString() + " USDT 价格挂单 " + amount.toString() + " " + baseSymbol;
+                  const taker = "马上吃单 " + takerAmount.toString() + " USDT";
+                  $('#records tr:first').after("<tr><td>"+getDateString()+"</td><td>"+maker+"，"+taker+"</td></tr>");
+                });
+              }, 1000);
+            });
+          });
+        });
+      }
+
+      $(document).ready(function() {
+        
+        $('#start-trade').click(function() {
+          $('#start-trade').unbind();
+          $('#start-trade').text("正在自动挂单...");
+          startTrade();
+          intervalId = setInterval(function () {
+            startTrade();
+            console.info(moment.utc().unix());
+          }, 1000 * 60 * 5);
+        });
+      });
+    </script>
+  </head>
+  <body style="margin: 0px; padding: 0px;">
+    <div style="position:absolute; width: 720px; left:50%; margin-left: -300px;">
+        <div style="padding-top: 20px;" id="generate-user-panel">
+          <button id="start-trade" style="margin-top: 20px; margin-bottom: 10px; padding: 12px 24px; font-size: 16px; text-align: center; text-decoration: none; display: inline-block; border: none; background-color: #4CAF50; color: white; border-radius: 2px;">开始刷价格</button>
+          <label id="current-price" style="margin-left: 10px">当前价格：0.0001 USDT</label>
+          <div id="error" style="color: red; display: none;">
+            <h3>测试</h3>
+          </div>
+          <table id="records">
+            <tr>
+              <th>时间</th>
+              <th>记录</th>
+            </tr>
+          </table>
+        </div>
+      </div>
+  </body>
+</html>
